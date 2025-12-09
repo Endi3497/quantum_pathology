@@ -113,21 +113,24 @@ def correlation_features(circuit: QuantumCircuit, param_bind: dict, backend=None
 
 
 def _apply_single_qubit(state: torch.Tensor, gate: torch.Tensor, qubit: int, num_qubits: int) -> torch.Tensor:
-    state = state.view([2] * num_qubits)
-    state = state.movedim(qubit, -1)
+    # state: [B, 2**n], gate: [2,2]
+    bsz = state.shape[0]
+    state = state.view(bsz, *([2] * num_qubits))
+    state = state.movedim(qubit + 1, -1)  # +1 to skip batch dim
     orig_shape = state.shape
     state = state.reshape(-1, 2)
     state = torch.matmul(state, gate.t())
     state = state.reshape(orig_shape)
-    state = state.movedim(-1, qubit)
-    return state
+    state = state.movedim(-1, qubit + 1)
+    return state.view(bsz, -1)
 
 
 def _apply_cnot(state: torch.Tensor, control: int, target: int, num_qubits: int) -> torch.Tensor:
     if control == target:
         return state
-    state = state.view([2] * num_qubits)
-    state = state.movedim([control, target], [-2, -1])
+    bsz = state.shape[0]
+    state = state.view(bsz, *([2] * num_qubits))
+    state = state.movedim([control + 1, target + 1], [-2, -1])
     orig_shape = state.shape
     state = state.reshape(-1, 4)
     cnot = state.new_tensor(
@@ -135,8 +138,8 @@ def _apply_cnot(state: torch.Tensor, control: int, target: int, num_qubits: int)
     )
     state = torch.matmul(state, cnot.t())
     state = state.reshape(orig_shape)
-    state = state.movedim([-2, -1], [control, target])
-    return state
+    state = state.movedim([-2, -1], [control + 1, target + 1])
+    return state.view(bsz, -1)
 
 
 def simulate_torch_features(
@@ -147,14 +150,23 @@ def simulate_torch_features(
     measurement: str,
 ) -> torch.Tensor:
     """
-    Differentiable torch simulation (statevector) for small qubit counts (default 8).
+    Differentiable torch simulation (statevector) with batch support.
+    angles: [B, data_dim] or [data_dim]
+    theta: [param_shape]
+    returns: [B, feature_dim] or [feature_dim]
     """
+    if angles.dim() == 1:
+        angles = angles.unsqueeze(0)
+    if theta.dim() != 1:
+        raise ValueError("theta must be 1-D")
+    batch = angles.shape[0]
+
     device = theta.device
     dtype = torch.complex64 if theta.dtype == torch.float32 else torch.complex128
     angles = angles.to(device=device, dtype=theta.dtype)
 
-    state = torch.zeros(2**num_qubits, device=device, dtype=dtype)
-    state[0] = 1.0 + 0j
+    state = torch.zeros(batch, 2**num_qubits, device=device, dtype=dtype)
+    state[:, 0] = 1.0 + 0j
 
     def rx_gate(phi):
         return torch.stack(
@@ -173,17 +185,19 @@ def simulate_torch_features(
         )
 
     idx = 0
-    total = angles.numel()
+    total = angles.shape[1]
     for _ in range(math.ceil(total / num_qubits / 2)):
         for q in range(num_qubits):
             if idx >= total:
                 break
-            state = _apply_single_qubit(state, ry_gate(angles[idx]), q, num_qubits)
+            gate = ry_gate(angles[:, idx]).to(device=device, dtype=dtype)
+            state = _apply_single_qubit(state, gate, q, num_qubits)
             idx += 1
         for q in range(num_qubits):
             if idx >= total:
                 break
-            state = _apply_single_qubit(state, rx_gate(angles[idx]), q, num_qubits)
+            gate = rx_gate(angles[:, idx]).to(device=device, dtype=dtype)
+            state = _apply_single_qubit(state, gate, q, num_qubits)
             idx += 1
 
     idx_theta = 0
@@ -191,31 +205,38 @@ def simulate_torch_features(
         for q in range(num_qubits):
             state = _apply_cnot(state, q, (q + 1) % num_qubits, num_qubits)
         for q in range(num_qubits):
-            state = _apply_single_qubit(state, rx_gate(theta[idx_theta]), q, num_qubits)
+            gate = rx_gate(theta[idx_theta]).to(device=device, dtype=dtype)
+            state = _apply_single_qubit(state, gate, q, num_qubits)
             idx_theta += 1
         for q in range(num_qubits):
-            state = _apply_single_qubit(state, ry_gate(theta[idx_theta]), q, num_qubits)
+            gate = ry_gate(theta[idx_theta]).to(device=device, dtype=dtype)
+            state = _apply_single_qubit(state, gate, q, num_qubits)
             idx_theta += 1
 
     if measurement == "statevector":
-        return torch.cat([state.real, state.imag], dim=0)
-    if measurement == "correlations":
-        probs = state.abs() ** 2
-        idxs = torch.arange(probs.numel(), device=device)
+        out = torch.cat([state.real, state.imag], dim=-1)
+    elif measurement == "correlations":
+        probs = state.abs() ** 2  # [B, 2^n]
+        idxs = torch.arange(probs.shape[1], device=device)
         values = []
         for bits in ([i] for i in range(num_qubits)):
             parity = ((idxs.unsqueeze(1) >> torch.tensor(bits, device=device)) & 1).sum(dim=1) % 2
             eig = 1 - 2 * parity
-            values.append((probs * eig).sum())
+            values.append((probs * eig).sum(dim=1))
         from itertools import combinations
 
         for r in [2, 3]:
             for combo in combinations(range(num_qubits), r):
                 parity = ((idxs.unsqueeze(1) >> torch.tensor(combo, device=device)) & 1).sum(dim=1) % 2
                 eig = 1 - 2 * parity
-                values.append((probs * eig).sum())
-        return torch.stack(values)
-    raise ValueError("measurement must be 'statevector' or 'correlations'")
+                values.append((probs * eig).sum(dim=1))
+        out = torch.stack(values, dim=1)
+    else:
+        raise ValueError("measurement must be 'statevector' or 'correlations'")
+
+    if out.shape[0] == 1:
+        return out.squeeze(0)
+    return out
 
 
 class QuantumFeatureFunction(Function):
@@ -274,7 +295,7 @@ class QuantumAnsatz:
     vqc_layers: int = 1
     measurement: str = "statevector"
     backend_device: str = "cpu"  # "cpu" or "gpu"
-    use_torch_autograd: bool = False
+    use_torch_autograd: bool = True
 
     def __post_init__(self) -> None:
         self.measurement = self.measurement.lower()
@@ -459,6 +480,15 @@ class SharedQKVProjector(nn.Module):
         self, image: torch.Tensor, patch_size: int | Sequence[int], param_values: Sequence[float] | None = None
     ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         angles = split_patch_angles(image, patch_size)
+        if self.trainable:
+            angle_tensor = torch.stack([a for a in angles], dim=0).to(self.device or angles.device)
+            feats = self.ansatz.torch_features(angle_tensor, self.theta)
+            if feats.dim() == 1:
+                feats = feats.unsqueeze(0)
+            q = self.query(feats)
+            k = self.key(feats)
+            v = self.value(feats)
+            return [(q[i], k[i], v[i]) for i in range(q.shape[0])]
         return [self.forward_patch(a.tolist(), param_values) for a in angles]
 
 

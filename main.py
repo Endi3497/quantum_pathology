@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vqc-layers", type=int, default=1)
     parser.add_argument("--measurement", type=str, default="statevector", choices=["statevector", "correlations"])
     parser.add_argument("--backend-device", type=str, default="cpu", choices=["cpu", "gpu"])
+    parser.add_argument("--use-torch-autograd", action="store_true", default=True)
 
     # QKV options
     parser.add_argument("--qkv-mode", type=str, default="shared", choices=["shared", "separate"])
