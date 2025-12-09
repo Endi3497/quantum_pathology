@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import torch.optim as optim
 from qiskit import QuantumCircuit
 from qiskit.circuit import ParameterVector
 from qiskit.quantum_info import Pauli, Statevector
@@ -499,6 +500,57 @@ def _stack_list(features: Sequence[np.ndarray] | Sequence[torch.Tensor], device:
     if isinstance(features[0], torch.Tensor):
         return torch.stack([f.to(device=device) for f in features], dim=0)
     return torch.stack([torch.from_numpy(np.asarray(f)).to(device=device) for f in features], dim=0)
+
+
+class HybridQuantumClassifier(nn.Module):
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int | Sequence[int],
+        ansatz: QuantumAnsatz,
+        q_dim: int,
+        k_dim: int,
+        v_dim: int,
+        attn_layers: int,
+        attn_type: str,
+        rbf_gamma: float,
+        agg_mode: str,
+        hidden_dims: Sequence[int],
+        dropout: float,
+        device: torch.device | str,
+    ) -> None:
+        super().__init__()
+        self.device = torch.device(device)
+        self.patch_size = _normalize_patch_size(patch_size)
+        self.patch_count = (image_size // self.patch_size[0]) * (image_size // self.patch_size[1])
+        self.qkv = SharedQKVProjector(
+            ansatz,
+            q_dim=q_dim,
+            k_dim=k_dim,
+            v_dim=v_dim,
+            device=self.device,
+            trainable=True,
+        )
+        self.attn = StackedSelfAttention(dim=v_dim, num_layers=attn_layers, attn_type=attn_type, gamma=rbf_gamma)
+        self.agg_mode = agg_mode
+        in_dim = v_dim * self.patch_count if agg_mode == "concat" else v_dim * 2
+        self.classifier = BinaryClassifier(in_dim=in_dim, hidden_dims=hidden_dims, dropout=dropout)
+        self.to(self.device)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if images.dim() != 4:
+            raise ValueError("images must be [B, C, H, W]")
+        outputs = []
+        for img in images:
+            qkv_list = self.qkv.forward_image(img, self.patch_size)
+            q = torch.stack([t[0] for t in qkv_list], dim=0).to(self.device)
+            k = torch.stack([t[1] for t in qkv_list], dim=0).to(self.device)
+            v = torch.stack([t[2] for t in qkv_list], dim=0).to(self.device)
+            attn_out = self.attn(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))  # [1, P, v_dim]
+            emb = aggregate_patches(attn_out, mode=self.agg_mode)  # [1, in_dim]
+            outputs.append(emb.squeeze(0))
+        feats = torch.stack(outputs, dim=0)
+        return self.classifier(feats)
 
 
 class AttentionLayer(nn.Module):
