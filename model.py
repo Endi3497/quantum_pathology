@@ -10,9 +10,6 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.optim as optim
-from qiskit import QuantumCircuit
-from qiskit.circuit import ParameterVector
-from qiskit.quantum_info import Pauli, Statevector
 
 
 def _normalize_patch_size(patch_size: int | Sequence[int]) -> Tuple[int, int]:
@@ -75,15 +72,17 @@ def add_vqc_layers(
 
 
 def _z_pauli(label_qubits: Iterable[int], num_qubits: int) -> Pauli:
+    from qiskit.quantum_info import Pauli
+
     z = ["I"] * num_qubits
     for q in label_qubits:
         z[num_qubits - q - 1] = "Z"
     return Pauli("".join(z))
 
 
-def _get_statevector(
-    circuit: QuantumCircuit, param_bind: dict, backend=None
-) -> Statevector:
+def _get_statevector(circuit, param_bind: dict, backend=None):
+    from qiskit.quantum_info import Statevector
+
     if backend is None:
         bound = circuit.assign_parameters(param_bind, inplace=False)
         return Statevector.from_instruction(bound)
@@ -93,13 +92,13 @@ def _get_statevector(
     return Statevector(data)
 
 
-def statevector_features(circuit: QuantumCircuit, param_bind: dict, backend=None) -> np.ndarray:
+def statevector_features(circuit, param_bind: dict, backend=None) -> np.ndarray:
     sv = _get_statevector(circuit, param_bind, backend)
     data = sv.data
     return np.concatenate([data.real, data.imag])
 
 
-def correlation_features(circuit: QuantumCircuit, param_bind: dict, backend=None) -> np.ndarray:
+def correlation_features(circuit, param_bind: dict, backend=None) -> np.ndarray:
     sv = _get_statevector(circuit, param_bind, backend)
     n = circuit.num_qubits
     values: List[float] = []
@@ -119,7 +118,7 @@ def _apply_single_qubit(state: torch.Tensor, gate: torch.Tensor, qubit: int, num
     gate: [2, 2] (shared) or [B, 2, 2] (per batch)
     """
     bsz = state.shape[0]
-    state = state.view(bsz, *([2] * num_qubits))
+    state = state.reshape(bsz, *([2] * num_qubits))
     state = state.movedim(qubit + 1, -1)
     state = state.reshape(bsz, -1, 2)
 
@@ -135,14 +134,14 @@ def _apply_single_qubit(state: torch.Tensor, gate: torch.Tensor, qubit: int, num
 
     state = state.reshape(bsz, *([2] * (num_qubits - 1)), 2)
     state = state.movedim(-1, qubit + 1)
-    return state.view(bsz, -1)
+    return state.reshape(bsz, -1).contiguous()
 
 
 def _apply_cnot(state: torch.Tensor, control: int, target: int, num_qubits: int) -> torch.Tensor:
     if control == target:
         return state
     bsz = state.shape[0]
-    state = state.view(bsz, *([2] * num_qubits))
+    state = state.reshape(bsz, *([2] * num_qubits))
     state = state.movedim([control + 1, target + 1], [-2, -1])
     orig_shape = state.shape
     state = state.reshape(-1, 4)
@@ -152,7 +151,7 @@ def _apply_cnot(state: torch.Tensor, control: int, target: int, num_qubits: int)
     state = torch.matmul(state, cnot.t())
     state = state.reshape(orig_shape)
     state = state.movedim([-2, -1], [control + 1, target + 1])
-    return state.view(bsz, -1)
+    return state.reshape(bsz, -1).contiguous()
 
 
 def simulate_torch_features(
@@ -301,26 +300,35 @@ class QuantumAnsatz:
 
     def __post_init__(self) -> None:
         self.measurement = self.measurement.lower()
-        self.params = ParameterVector("theta", self.vqc_layers * 2 * self.num_qubits)
-        self.data_params = ParameterVector("x", self.data_dim)
+        self.params = None
+        self.data_params = None
         self.backend = None
-        if (not self.use_torch_autograd) and self.backend_device.lower() == "gpu":
-            try:
-                from qiskit_aer import AerSimulator
-            except ImportError as exc:
-                raise ImportError("qiskit-aer-gpu is required for GPU backend") from exc
-            self.backend = AerSimulator(method="statevector", device="GPU")
-        self.template = None if self.use_torch_autograd else self._build_template()
+        self.template = None
+        if not self.use_torch_autograd:
+            from qiskit import QuantumCircuit
+            from qiskit.circuit import ParameterVector
+
+            self.params = ParameterVector("theta", self.param_shape)
+            self.data_params = ParameterVector("x", self.data_dim)
+            if self.backend_device.lower() == "gpu":
+                try:
+                    from qiskit_aer import AerSimulator
+                except ImportError as exc:
+                    raise ImportError("qiskit-aer-gpu is required for GPU backend") from exc
+                self.backend = AerSimulator(method="statevector", device="GPU")
+            self.template = self._build_template()
 
     @property
     def param_shape(self) -> int:
-        return len(self.params)
+        return self.vqc_layers * 2 * self.num_qubits
 
     @property
     def feature_dim(self) -> int:
         return measurement_dim(self.num_qubits, self.measurement)
 
     def _build_template(self) -> QuantumCircuit:
+        from qiskit import QuantumCircuit
+
         circuit = QuantumCircuit(self.num_qubits)
         encode_params(circuit, self.data_params, num_qubits=self.num_qubits)
         add_vqc_layers(circuit, self.params, 0, self.vqc_layers, num_qubits=self.num_qubits)
@@ -340,6 +348,12 @@ class QuantumAnsatz:
         return self.template.assign_parameters(bind, inplace=False)
 
     def features(self, patch_angles: Sequence[float], param_values: Sequence[float] | None = None) -> np.ndarray:
+        if self.use_torch_autograd:
+            angles_t = torch.as_tensor(patch_angles, dtype=torch.float32)
+            theta_t = torch.as_tensor(
+                param_values if param_values is not None else [0.0] * self.param_shape, dtype=torch.float32
+            )
+            return self.torch_features(angles_t, theta_t).detach().cpu().numpy()
         if param_values is None:
             param_values = [0.0] * self.param_shape
         if len(param_values) != self.param_shape:
