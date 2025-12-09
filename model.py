@@ -113,14 +113,26 @@ def correlation_features(circuit: QuantumCircuit, param_bind: dict, backend=None
 
 
 def _apply_single_qubit(state: torch.Tensor, gate: torch.Tensor, qubit: int, num_qubits: int) -> torch.Tensor:
-    # state: [B, 2**n], gate: [2,2]
+    """
+    state: [B, 2**n]
+    gate: [2, 2] (shared) or [B, 2, 2] (per batch)
+    """
     bsz = state.shape[0]
     state = state.view(bsz, *([2] * num_qubits))
-    state = state.movedim(qubit + 1, -1)  # +1 to skip batch dim
-    orig_shape = state.shape
-    state = state.reshape(-1, 2)
-    state = torch.matmul(state, gate.t())
-    state = state.reshape(orig_shape)
+    state = state.movedim(qubit + 1, -1)
+    state = state.reshape(bsz, -1, 2)
+
+    if gate.dim() == 2:
+        gate = gate.unsqueeze(0)
+    if gate.dim() == 3 and gate.shape[0] != bsz and gate.shape[-1] == bsz:
+        gate = gate.permute(2, 0, 1)
+    if gate.dim() == 3 and gate.shape[0] == 1:
+        gate = gate.expand(bsz, -1, -1)
+
+    # state [B, N, 2], gate [B, 2, 2]
+    state = torch.matmul(state, gate.transpose(1, 2))
+
+    state = state.reshape(bsz, *([2] * (num_qubits - 1)), 2)
     state = state.movedim(-1, qubit + 1)
     return state.view(bsz, -1)
 
@@ -169,20 +181,44 @@ def simulate_torch_features(
     state[:, 0] = 1.0 + 0j
 
     def rx_gate(phi):
-        return torch.stack(
-            [
-                torch.stack([torch.cos(phi / 2), -1j * torch.sin(phi / 2)]),
-                torch.stack([-1j * torch.sin(phi / 2), torch.cos(phi / 2)]),
-            ]
-        )
+        if phi.dim() == 0:
+            c = torch.cos(phi / 2)
+            s = torch.sin(phi / 2)
+            gate = torch.stack(
+                [
+                    torch.stack([c, -1j * s]),
+                    torch.stack([-1j * s, c]),
+                ]
+            )
+        else:
+            c = torch.cos(phi / 2)
+            s = torch.sin(phi / 2)
+            gate = torch.zeros(phi.shape[0], 2, 2, device=device, dtype=dtype)
+            gate[:, 0, 0] = c
+            gate[:, 0, 1] = -1j * s
+            gate[:, 1, 0] = -1j * s
+            gate[:, 1, 1] = c
+        return gate
 
     def ry_gate(phi):
-        return torch.stack(
-            [
-                torch.stack([torch.cos(phi / 2), -torch.sin(phi / 2)]),
-                torch.stack([torch.sin(phi / 2), torch.cos(phi / 2)]),
-            ]
-        )
+        if phi.dim() == 0:
+            c = torch.cos(phi / 2)
+            s = torch.sin(phi / 2)
+            gate = torch.stack(
+                [
+                    torch.stack([c, -s]),
+                    torch.stack([s, c]),
+                ]
+            )
+        else:
+            c = torch.cos(phi / 2)
+            s = torch.sin(phi / 2)
+            gate = torch.zeros(phi.shape[0], 2, 2, device=device, dtype=dtype)
+            gate[:, 0, 0] = c
+            gate[:, 0, 1] = -s
+            gate[:, 1, 0] = s
+            gate[:, 1, 1] = c
+        return gate
 
     idx = 0
     total = angles.shape[1]
@@ -237,41 +273,6 @@ def simulate_torch_features(
     if out.shape[0] == 1:
         return out.squeeze(0)
     return out
-
-
-class QuantumFeatureFunction(Function):
-    @staticmethod
-    def forward(ctx, ansatz: "QuantumAnsatz", angles: torch.Tensor, theta: torch.Tensor):
-        with torch.no_grad():
-            angle_list = angles.detach().cpu().numpy().tolist()
-            theta_list = theta.detach().cpu().numpy().tolist()
-            out = ansatz.features(angle_list, theta_list)
-        output = torch.from_numpy(out).to(theta.device, dtype=theta.dtype)
-        ctx.ansatz = ansatz
-        ctx.save_for_backward(angles.detach(), theta.detach())
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        ansatz = ctx.ansatz
-        angles, theta = ctx.saved_tensors
-        grad_theta = torch.zeros_like(theta)
-        grad_angles = None  # not computing gradients w.r.t. inputs
-
-        # Parameter-shift for RX/RY gates (shift = pi/2)
-        shift = math.pi / 2.0
-        angle_list = angles.cpu().numpy().tolist()
-        for i in range(theta.numel()):
-            theta_plus = theta.clone()
-            theta_minus = theta.clone()
-            theta_plus[i] += shift
-            theta_minus[i] -= shift
-            f_plus = ansatz.features(angle_list, theta_plus.cpu().numpy().tolist())
-            f_minus = ansatz.features(angle_list, theta_minus.cpu().numpy().tolist())
-            diff = (np.asarray(f_plus) - np.asarray(f_minus)) * 0.5
-            grad_theta[i] = (grad_output.detach().cpu().flatten() * torch.from_numpy(diff).float()).sum()
-
-        return None, grad_angles, grad_theta
 
 
 def _comb(n: int, r: int) -> int:
@@ -377,7 +378,7 @@ class QuantumPatchModel:
     vqc_layers: int = 1
     measurement: str = "statevector"  # "statevector" or "correlations"
     backend_device: str = "cpu"
-    use_torch_autograd: bool = False
+    use_torch_autograd: bool = True
 
     def __post_init__(self) -> None:
         self.patch_size = _normalize_patch_size(self.patch_size)
