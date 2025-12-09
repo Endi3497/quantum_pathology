@@ -38,19 +38,19 @@ def split_patch_angles(image: torch.Tensor, patch_size: int | Sequence[int]) -> 
     return angles
 
 
-def encode_angles(circuit: QuantumCircuit, angles: Sequence[float], num_qubits: int = 8) -> None:
+def encode_params(circuit: QuantumCircuit, params: Sequence, num_qubits: int = 8) -> None:
     idx = 0
-    total = len(angles)
+    total = len(params)
     while idx < total:
         for q in range(num_qubits):
             if idx >= total:
                 break
-            circuit.ry(float(angles[idx]), q)
+            circuit.ry(params[idx], q)
             idx += 1
         for q in range(num_qubits):
             if idx >= total:
                 break
-            circuit.rx(float(angles[idx]), q)
+            circuit.rx(params[idx], q)
             idx += 1
 
 
@@ -81,25 +81,25 @@ def _z_pauli(label_qubits: Iterable[int], num_qubits: int) -> Pauli:
 
 
 def _get_statevector(
-    circuit: QuantumCircuit, param_binds: Sequence[float], backend=None
+    circuit: QuantumCircuit, param_bind: dict, backend=None
 ) -> Statevector:
-    bound = circuit.assign_parameters(param_binds, inplace=False)
     if backend is None:
+        bound = circuit.assign_parameters(param_bind, inplace=False)
         return Statevector.from_instruction(bound)
-    job = backend.run(bound)
+    job = backend.run(circuit, parameter_binds=[param_bind])
     result = job.result()
-    data = np.array(result.get_statevector(bound), dtype=complex)
+    data = np.array(result.get_statevector(circuit, param_bind), dtype=complex)
     return Statevector(data)
 
 
-def statevector_features(circuit: QuantumCircuit, param_binds: Sequence[float], backend=None) -> np.ndarray:
-    sv = _get_statevector(circuit, param_binds, backend)
+def statevector_features(circuit: QuantumCircuit, param_bind: dict, backend=None) -> np.ndarray:
+    sv = _get_statevector(circuit, param_bind, backend)
     data = sv.data
     return np.concatenate([data.real, data.imag])
 
 
-def correlation_features(circuit: QuantumCircuit, param_binds: Sequence[float], backend=None) -> np.ndarray:
-    sv = _get_statevector(circuit, param_binds, backend)
+def correlation_features(circuit: QuantumCircuit, param_bind: dict, backend=None) -> np.ndarray:
+    sv = _get_statevector(circuit, param_bind, backend)
     n = circuit.num_qubits
     values: List[float] = []
 
@@ -110,6 +110,147 @@ def correlation_features(circuit: QuantumCircuit, param_binds: Sequence[float], 
     for op in singles + pairs + triples:
         values.append(float(np.real(sv.expectation_value(op))))
     return np.array(values, dtype=np.float64)
+
+
+def _apply_single_qubit(state: torch.Tensor, gate: torch.Tensor, qubit: int, num_qubits: int) -> torch.Tensor:
+    state = state.view([2] * num_qubits)
+    state = state.movedim(qubit, -1)
+    orig_shape = state.shape
+    state = state.reshape(-1, 2)
+    state = torch.matmul(state, gate.t())
+    state = state.reshape(orig_shape)
+    state = state.movedim(-1, qubit)
+    return state
+
+
+def _apply_cnot(state: torch.Tensor, control: int, target: int, num_qubits: int) -> torch.Tensor:
+    if control == target:
+        return state
+    state = state.view([2] * num_qubits)
+    state = state.movedim([control, target], [-2, -1])
+    orig_shape = state.shape
+    state = state.reshape(-1, 4)
+    cnot = state.new_tensor(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], dtype=state.dtype
+    )
+    state = torch.matmul(state, cnot.t())
+    state = state.reshape(orig_shape)
+    state = state.movedim([-2, -1], [control, target])
+    return state
+
+
+def simulate_torch_features(
+    angles: torch.Tensor,
+    theta: torch.Tensor,
+    num_qubits: int,
+    vqc_layers: int,
+    measurement: str,
+) -> torch.Tensor:
+    """
+    Differentiable torch simulation (statevector) for small qubit counts (default 8).
+    """
+    device = theta.device
+    dtype = torch.complex64 if theta.dtype == torch.float32 else torch.complex128
+    angles = angles.to(device=device, dtype=theta.dtype)
+
+    state = torch.zeros(2**num_qubits, device=device, dtype=dtype)
+    state[0] = 1.0 + 0j
+
+    def rx_gate(phi):
+        return torch.stack(
+            [
+                torch.stack([torch.cos(phi / 2), -1j * torch.sin(phi / 2)]),
+                torch.stack([-1j * torch.sin(phi / 2), torch.cos(phi / 2)]),
+            ]
+        )
+
+    def ry_gate(phi):
+        return torch.stack(
+            [
+                torch.stack([torch.cos(phi / 2), -torch.sin(phi / 2)]),
+                torch.stack([torch.sin(phi / 2), torch.cos(phi / 2)]),
+            ]
+        )
+
+    idx = 0
+    total = angles.numel()
+    for _ in range(math.ceil(total / num_qubits / 2)):
+        for q in range(num_qubits):
+            if idx >= total:
+                break
+            state = _apply_single_qubit(state, ry_gate(angles[idx]), q, num_qubits)
+            idx += 1
+        for q in range(num_qubits):
+            if idx >= total:
+                break
+            state = _apply_single_qubit(state, rx_gate(angles[idx]), q, num_qubits)
+            idx += 1
+
+    idx_theta = 0
+    for _ in range(vqc_layers):
+        for q in range(num_qubits):
+            state = _apply_cnot(state, q, (q + 1) % num_qubits, num_qubits)
+        for q in range(num_qubits):
+            state = _apply_single_qubit(state, rx_gate(theta[idx_theta]), q, num_qubits)
+            idx_theta += 1
+        for q in range(num_qubits):
+            state = _apply_single_qubit(state, ry_gate(theta[idx_theta]), q, num_qubits)
+            idx_theta += 1
+
+    if measurement == "statevector":
+        return torch.cat([state.real, state.imag], dim=0)
+    if measurement == "correlations":
+        probs = state.abs() ** 2
+        idxs = torch.arange(probs.numel(), device=device)
+        values = []
+        for bits in ([i] for i in range(num_qubits)):
+            parity = ((idxs.unsqueeze(1) >> torch.tensor(bits, device=device)) & 1).sum(dim=1) % 2
+            eig = 1 - 2 * parity
+            values.append((probs * eig).sum())
+        from itertools import combinations
+
+        for r in [2, 3]:
+            for combo in combinations(range(num_qubits), r):
+                parity = ((idxs.unsqueeze(1) >> torch.tensor(combo, device=device)) & 1).sum(dim=1) % 2
+                eig = 1 - 2 * parity
+                values.append((probs * eig).sum())
+        return torch.stack(values)
+    raise ValueError("measurement must be 'statevector' or 'correlations'")
+
+
+class QuantumFeatureFunction(Function):
+    @staticmethod
+    def forward(ctx, ansatz: "QuantumAnsatz", angles: torch.Tensor, theta: torch.Tensor):
+        with torch.no_grad():
+            angle_list = angles.detach().cpu().numpy().tolist()
+            theta_list = theta.detach().cpu().numpy().tolist()
+            out = ansatz.features(angle_list, theta_list)
+        output = torch.from_numpy(out).to(theta.device, dtype=theta.dtype)
+        ctx.ansatz = ansatz
+        ctx.save_for_backward(angles.detach(), theta.detach())
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ansatz = ctx.ansatz
+        angles, theta = ctx.saved_tensors
+        grad_theta = torch.zeros_like(theta)
+        grad_angles = None  # not computing gradients w.r.t. inputs
+
+        # Parameter-shift for RX/RY gates (shift = pi/2)
+        shift = math.pi / 2.0
+        angle_list = angles.cpu().numpy().tolist()
+        for i in range(theta.numel()):
+            theta_plus = theta.clone()
+            theta_minus = theta.clone()
+            theta_plus[i] += shift
+            theta_minus[i] -= shift
+            f_plus = ansatz.features(angle_list, theta_plus.cpu().numpy().tolist())
+            f_minus = ansatz.features(angle_list, theta_minus.cpu().numpy().tolist())
+            diff = (np.asarray(f_plus) - np.asarray(f_minus)) * 0.5
+            grad_theta[i] = (grad_output.detach().cpu().flatten() * torch.from_numpy(diff).float()).sum()
+
+        return None, grad_angles, grad_theta
 
 
 def _comb(n: int, r: int) -> int:
@@ -128,21 +269,25 @@ def measurement_dim(num_qubits: int, measurement: str) -> int:
 
 @dataclass
 class QuantumAnsatz:
+    data_dim: int
     num_qubits: int = 8
     vqc_layers: int = 1
     measurement: str = "statevector"
     backend_device: str = "cpu"  # "cpu" or "gpu"
+    use_torch_autograd: bool = False
 
     def __post_init__(self) -> None:
         self.measurement = self.measurement.lower()
         self.params = ParameterVector("theta", self.vqc_layers * 2 * self.num_qubits)
+        self.data_params = ParameterVector("x", self.data_dim)
         self.backend = None
-        if self.backend_device.lower() == "gpu":
+        if (not self.use_torch_autograd) and self.backend_device.lower() == "gpu":
             try:
                 from qiskit_aer import AerSimulator
             except ImportError as exc:
                 raise ImportError("qiskit-aer-gpu is required for GPU backend") from exc
             self.backend = AerSimulator(method="statevector", device="GPU")
+        self.template = None if self.use_torch_autograd else self._build_template()
 
     @property
     def param_shape(self) -> int:
@@ -152,43 +297,87 @@ class QuantumAnsatz:
     def feature_dim(self) -> int:
         return measurement_dim(self.num_qubits, self.measurement)
 
-    def circuit_for_angles(self, angles: Sequence[float]) -> QuantumCircuit:
+    def _build_template(self) -> QuantumCircuit:
         circuit = QuantumCircuit(self.num_qubits)
-        encode_angles(circuit, angles, num_qubits=self.num_qubits)
+        encode_params(circuit, self.data_params, num_qubits=self.num_qubits)
         add_vqc_layers(circuit, self.params, 0, self.vqc_layers, num_qubits=self.num_qubits)
         return circuit
+
+    def circuit_for_angles(
+        self, angles: Sequence[float], param_values: Sequence[float] | None = None
+    ) -> QuantumCircuit:
+        if param_values is None:
+            param_values = [0.0] * self.param_shape
+        if len(param_values) != self.param_shape:
+            raise ValueError(f"param_values must have length {self.param_shape}")
+        if len(angles) != self.data_dim:
+            raise ValueError(f"angles length {len(angles)} does not match data_dim {self.data_dim}")
+        bind = {self.data_params[i]: float(angles[i]) for i in range(self.data_dim)}
+        bind.update({self.params[i]: float(param_values[i]) for i in range(self.param_shape)})
+        return self.template.assign_parameters(bind, inplace=False)
 
     def features(self, patch_angles: Sequence[float], param_values: Sequence[float] | None = None) -> np.ndarray:
         if param_values is None:
             param_values = [0.0] * self.param_shape
         if len(param_values) != self.param_shape:
             raise ValueError(f"param_values must have length {self.param_shape}")
-        circuit = self.circuit_for_angles(patch_angles)
+        if len(patch_angles) != self.data_dim:
+            raise ValueError(f"patch_angles length {len(patch_angles)} does not match data_dim {self.data_dim}")
+        bind = {self.data_params[i]: float(patch_angles[i]) for i in range(self.data_dim)}
+        bind.update({self.params[i]: float(param_values[i]) for i in range(self.param_shape)})
         if self.measurement == "statevector":
-            return statevector_features(circuit, param_values, self.backend)
+            return statevector_features(self.template, bind, self.backend)
         if self.measurement == "correlations":
-            return correlation_features(circuit, param_values, self.backend)
+            return correlation_features(self.template, bind, self.backend)
         raise ValueError("measurement must be 'statevector' or 'correlations'")
+
+    def torch_features(self, patch_angles: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        if not self.use_torch_autograd:
+            # Fallback: use numpy path (non-differentiable)
+            feats = self.features(
+                patch_angles.detach().cpu().numpy().tolist(),
+                theta.detach().cpu().numpy().tolist(),
+            )
+            return torch.as_tensor(feats, dtype=theta.dtype, device=theta.device)
+        return simulate_torch_features(
+            patch_angles,
+            theta,
+            num_qubits=self.num_qubits,
+            vqc_layers=self.vqc_layers,
+            measurement=self.measurement,
+        )
 
 
 @dataclass
 class QuantumPatchModel:
     patch_size: int | Sequence[int] = 4
+    channels: int = 2
     num_qubits: int = 8
     vqc_layers: int = 1
     measurement: str = "statevector"  # "statevector" or "correlations"
+    backend_device: str = "cpu"
+    use_torch_autograd: bool = False
 
     def __post_init__(self) -> None:
         self.patch_size = _normalize_patch_size(self.patch_size)
-        self.ansatz = QuantumAnsatz(self.num_qubits, self.vqc_layers, self.measurement)
+        patch_h, patch_w = self.patch_size
+        data_dim = self.channels * patch_h * patch_w
+        self.ansatz = QuantumAnsatz(
+            data_dim=data_dim,
+            num_qubits=self.num_qubits,
+            vqc_layers=self.vqc_layers,
+            measurement=self.measurement,
+            backend_device=self.backend_device,
+            use_torch_autograd=self.use_torch_autograd,
+        )
         self.params = self.ansatz.params
 
     @property
     def param_shape(self) -> int:
         return self.ansatz.param_shape
 
-    def circuit_for_angles(self, angles: Sequence[float]) -> QuantumCircuit:
-        return self.ansatz.circuit_for_angles(angles)
+    def circuit_for_angles(self, angles: Sequence[float], param_values: Sequence[float] | None = None) -> QuantumCircuit:
+        return self.ansatz.circuit_for_angles(angles, param_values)
 
     def features(self, patch_angles: Sequence[float], param_values: Sequence[float] | None = None) -> np.ndarray:
         return self.ansatz.features(patch_angles, param_values)
@@ -238,10 +427,14 @@ class SharedQKVProjector(nn.Module):
         k_dim: int,
         v_dim: int,
         device: torch.device | str | None = None,
+        trainable: bool = False,
     ) -> None:
         super().__init__()
         self.ansatz = ansatz
         self.device = torch.device(device) if device is not None else None
+        self.trainable = trainable
+        if trainable:
+            self.theta = nn.Parameter(torch.zeros(ansatz.param_shape, dtype=torch.float32))
         fdim = ansatz.feature_dim
         self.query = nn.Linear(fdim, q_dim, bias=False)
         self.key = nn.Linear(fdim, k_dim, bias=False)
@@ -250,8 +443,12 @@ class SharedQKVProjector(nn.Module):
     def forward_patch(
         self, patch_angles: Sequence[float], param_values: Sequence[float] | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        feats = self.ansatz.features(patch_angles, param_values)
-        x = torch.as_tensor(feats, dtype=torch.float32, device=self.device).unsqueeze(0)
+        if self.trainable:
+            angles_t = torch.as_tensor(patch_angles, dtype=torch.float32, device=self.device)
+            x = self.ansatz.torch_features(angles_t, self.theta).unsqueeze(0)
+        else:
+            feats = self.ansatz.features(patch_angles, param_values)
+            x = torch.as_tensor(feats, dtype=torch.float32, device=self.device).unsqueeze(0)
         return (
             self.query(x).squeeze(0),
             self.key(x).squeeze(0),

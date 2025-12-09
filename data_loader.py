@@ -4,12 +4,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
+import math
+import os
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
-import math
 
 # Map text labels to binary targets; anything else is skipped.
 STATUS_TO_LABEL = {"Positive": 1, "Negative": 0}
@@ -225,8 +227,6 @@ def default_paths() -> Tuple[Path, Path]:
     """
     Provide the canonical image directory and CSV path for convenience.
     """
-    base = Path("/home/junyeollee/QSANN/data/TCGA_BRCA_128x128")
-    return (
-        base / "grid" / "4patch",
-        base / "DX1_ER_PR_HER2.csv",
-    )
+    base_env = os.getenv("QSANN_DATA_ROOT", "data/TCGA_BRCA_128x128")
+    base = Path(base_env)
+    return (base / "grid" / "4patch", base / "DX1_ER_PR_HER2.csv")

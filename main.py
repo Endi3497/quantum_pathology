@@ -10,8 +10,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quantum patch model training entrypoint")
 
     # Data
-    parser.add_argument("--image-dir", type=Path, default=Path("/home/junyeollee/QSANN/data/TCGA_BRCA_128x128/grid/4patch"))
-    parser.add_argument("--labels-csv", type=Path, default=Path("/home/junyeollee/QSANN/data/TCGA_BRCA_128x128/DX1_ER_PR_HER2.csv"))
+    parser.add_argument("--image-dir", type=Path, default=Path("data/TCGA_BRCA_128x128/grid/4patch"))
+    parser.add_argument("--labels-csv", type=Path, default=Path("data/TCGA_BRCA_128x128/DX1_ER_PR_HER2.csv"))
     parser.add_argument("--target-column", type=str, default="ER_status_BCR", choices=["ER_status_BCR", "PR_status_BCR", "HER2_status_BCR"])
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--patch-size", type=int, default=4)
@@ -56,8 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
 
     # Logging / checkpoints
-    parser.add_argument("--log-dir", type=Path, default=Path("/home/junyeollee/QSANN/results/logs"))
-    parser.add_argument("--model-dir", type=Path, default=Path("/home/junyeollee/QSANN/results/models"))
+    parser.add_argument("--log-dir", type=Path, default=Path("results/logs"))
+    parser.add_argument("--model-dir", type=Path, default=Path("results/models"))
     parser.add_argument("--run-name", type=str, default="run")
 
     return parser
