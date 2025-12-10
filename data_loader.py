@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split, Subset
 
 # Map text labels to binary targets; anything else is skipped.
 STATUS_TO_LABEL = {"Positive": 1, "Negative": 0}
@@ -191,6 +191,50 @@ def split_dataset(
     return random_split(dataset, [train_len, val_len, test_len], generator=generator)
 
 
+def _patient_key(path: Path) -> str:
+    """Group patches by slide/patient: remove suffix, then drop the UUID part after the first dot."""
+    base = _strip_suffix(path)
+    return base.split(".")[0]
+
+
+def split_dataset_by_patient(
+    dataset: TwoChannelGridDataset,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+) -> Tuple[Subset, Subset, Subset]:
+    s = train_ratio + val_ratio + test_ratio
+    if not math.isclose(s, 1.0, rel_tol=1e-3):
+        raise ValueError("train_ratio + val_ratio + test_ratio must sum to 1.")
+    # Build mapping patient_id -> list of indices
+    patient_to_indices: Dict[str, List[int]] = {}
+    for idx, (path, _) in enumerate(dataset.samples):
+        key = _patient_key(path)
+        patient_to_indices.setdefault(key, []).append(idx)
+    patients = sorted(patient_to_indices.keys())
+    rng = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(patients), generator=rng).tolist()
+    patients = [patients[i] for i in perm]
+    n = len(patients)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+    train_patients = set(patients[:n_train])
+    val_patients = set(patients[n_train : n_train + n_val])
+    test_patients = set(patients[n_train + n_val :])
+
+    def collect(p_set: set) -> List[int]:
+        idxs: List[int] = []
+        for p in p_set:
+            idxs.extend(patient_to_indices[p])
+        return idxs
+
+    train_indices = collect(train_patients)
+    val_indices = collect(val_patients)
+    test_indices = collect(test_patients)
+    return Subset(dataset, train_indices), Subset(dataset, val_indices), Subset(dataset, test_indices)
+
+
 def build_loaders_with_split(
     image_dir: Path | str,
     labels_csv: Path | str,
@@ -203,6 +247,7 @@ def build_loaders_with_split(
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
     seed: int = 42,
+    patient_split: bool = True,
 ) -> Tuple[Tuple[DataLoader, Dataset], Tuple[DataLoader, Dataset], Tuple[DataLoader, Dataset]]:
     full_dataset = TwoChannelGridDataset(
         image_dir=image_dir,
@@ -210,7 +255,10 @@ def build_loaders_with_split(
         target_column=target_column,
         image_size=image_size,
     )
-    train_set, val_set, test_set = split_dataset(full_dataset, train_ratio, val_ratio, test_ratio, seed)
+    if patient_split:
+        train_set, val_set, test_set = split_dataset_by_patient(full_dataset, train_ratio, val_ratio, test_ratio, seed)
+    else:
+        train_set, val_set, test_set = split_dataset(full_dataset, train_ratio, val_ratio, test_ratio, seed)
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
     )

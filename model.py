@@ -32,7 +32,7 @@ def split_patch_angles(image: torch.Tensor, patch_size: int | Sequence[int]) -> 
     patch_h, patch_w = _normalize_patch_size(patch_size)
     unfold = F.unfold(image.unsqueeze(0), kernel_size=(patch_h, patch_w), stride=(patch_h, patch_w))
     patches = unfold.squeeze(0).t()  # [num_patches, C * patch_area]
-    angles = patches.clamp(0, 255).float() * (math.pi / 255.0)
+    angles = patches.clamp(0, 1).float() * math.pi
     return angles
 
 
@@ -471,7 +471,7 @@ class SharedQKVProjector(nn.Module):
         self.device = torch.device(device) if device is not None else None
         self.trainable = trainable
         if trainable:
-            self.theta = nn.Parameter(torch.zeros(ansatz.param_shape, dtype=torch.float32))
+            self.theta = nn.Parameter(torch.rand(ansatz.param_shape, dtype=torch.float32) * 2 * math.pi)
         fdim = ansatz.feature_dim
         self.query = nn.Linear(fdim, q_dim, bias=False)
         self.key = nn.Linear(fdim, k_dim, bias=False)
@@ -508,6 +508,64 @@ class SharedQKVProjector(nn.Module):
         return [self.forward_patch(a.tolist(), param_values) for a in angles]
 
 
+class SeparateQKVProjector(nn.Module):
+    def __init__(
+        self,
+        ansatz_q: QuantumAnsatz,
+        ansatz_k: QuantumAnsatz,
+        ansatz_v: QuantumAnsatz,
+        device: torch.device | str | None = None,
+        trainable: bool = True,
+    ) -> None:
+        super().__init__()
+        self.ansatz_q = ansatz_q
+        self.ansatz_k = ansatz_k
+        self.ansatz_v = ansatz_v
+        self.device = torch.device(device) if device is not None else None
+        self.trainable = trainable
+        if trainable:
+            self.theta_q = nn.Parameter(torch.zeros(ansatz_q.param_shape, dtype=torch.float32))
+            self.theta_k = nn.Parameter(torch.zeros(ansatz_k.param_shape, dtype=torch.float32))
+            self.theta_v = nn.Parameter(torch.zeros(ansatz_v.param_shape, dtype=torch.float32))
+
+    def forward_image(
+        self, image: torch.Tensor, patch_size: int | Sequence[int], param_values=None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        angles = split_patch_angles(image, patch_size)
+        angle_tensor = torch.stack([a for a in angles], dim=0).to(self.device or angles.device)
+        if self.trainable:
+            q = self.ansatz_q.torch_features(angle_tensor, self.theta_q)
+            k = self.ansatz_k.torch_features(angle_tensor, self.theta_k)
+            v = self.ansatz_v.torch_features(angle_tensor, self.theta_v)
+        else:
+            pv = param_values or {}
+            q_params = pv.get("q")
+            k_params = pv.get("k")
+            v_params = pv.get("v")
+            q = torch.as_tensor(
+                np.stack([self.ansatz_q.features(a.tolist(), q_params) for a in angles]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            k = torch.as_tensor(
+                np.stack([self.ansatz_k.features(a.tolist(), k_params) for a in angles]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            v = torch.as_tensor(
+                np.stack([self.ansatz_v.features(a.tolist(), v_params) for a in angles]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if q.dim() == 1:
+            q = q.unsqueeze(0)
+        if k.dim() == 1:
+            k = k.unsqueeze(0)
+        if v.dim() == 1:
+            v = v.unsqueeze(0)
+        return q, k, v
+
+
 def _stack_list(features: Sequence[np.ndarray] | Sequence[torch.Tensor], device: torch.device | None = None) -> torch.Tensor:
     if len(features) == 0:
         raise ValueError("features is empty")
@@ -522,32 +580,53 @@ class HybridQuantumClassifier(nn.Module):
         image_size: int,
         patch_size: int | Sequence[int],
         ansatz: QuantumAnsatz,
-        q_dim: int,
-        k_dim: int,
-        v_dim: int,
-        attn_layers: int,
-        attn_type: str,
-        rbf_gamma: float,
-        agg_mode: str,
-        hidden_dims: Sequence[int],
-        dropout: float,
-        device: torch.device | str,
+        ansatz_k: QuantumAnsatz | None = None,
+        ansatz_v: QuantumAnsatz | None = None,
+        q_dim: int = 64,
+        k_dim: int = 64,
+        v_dim: int = 64,
+        attn_layers: int = 1,
+        attn_type: str = "dot",
+        rbf_gamma: float = 1.0,
+        agg_mode: str = "concat",
+        hidden_dims: Sequence[int] = (),
+        dropout: float = 0.0,
+        device: torch.device | str = "cpu",
+        qkv_mode: str = "shared",
     ) -> None:
         super().__init__()
         self.device = torch.device(device)
         self.patch_size = _normalize_patch_size(patch_size)
         self.patch_count = (image_size // self.patch_size[0]) * (image_size // self.patch_size[1])
-        self.qkv = SharedQKVProjector(
-            ansatz,
-            q_dim=q_dim,
-            k_dim=k_dim,
-            v_dim=v_dim,
-            device=self.device,
-            trainable=True,
-        )
-        self.attn = StackedSelfAttention(dim=v_dim, num_layers=attn_layers, attn_type=attn_type, gamma=rbf_gamma)
+        self.qkv_mode = qkv_mode
+        if qkv_mode == "shared":
+            self.qkv = SharedQKVProjector(
+                ansatz,
+                q_dim=q_dim,
+                k_dim=k_dim,
+                v_dim=v_dim,
+                device=self.device,
+                trainable=True,
+            )
+            attn_dim = v_dim
+        elif qkv_mode == "separate":
+            if ansatz_k is None or ansatz_v is None:
+                raise ValueError("ansatz_k and ansatz_v are required for qkv_mode='separate'")
+            self.qkv = SeparateQKVProjector(
+                ansatz_q=ansatz,
+                ansatz_k=ansatz_k,
+                ansatz_v=ansatz_v,
+                device=self.device,
+                trainable=True,
+            )
+            attn_dim = ansatz_v.feature_dim
+            self.q_proj = nn.Identity()
+            self.k_proj = nn.Identity()
+        else:
+            raise ValueError("qkv_mode must be 'shared' or 'separate'")
+        self.attn = StackedSelfAttention(dim=attn_dim, num_layers=attn_layers, attn_type=attn_type, gamma=rbf_gamma)
         self.agg_mode = agg_mode
-        in_dim = v_dim * self.patch_count if agg_mode == "concat" else v_dim * 2
+        in_dim = attn_dim * self.patch_count if agg_mode == "concat" else attn_dim * 2
         self.classifier = BinaryClassifier(in_dim=in_dim, hidden_dims=hidden_dims, dropout=dropout)
         self.to(self.device)
 
@@ -556,10 +635,16 @@ class HybridQuantumClassifier(nn.Module):
             raise ValueError("images must be [B, C, H, W]")
         outputs = []
         for img in images:
-            qkv_list = self.qkv.forward_image(img, self.patch_size)
-            q = torch.stack([t[0] for t in qkv_list], dim=0).to(self.device)
-            k = torch.stack([t[1] for t in qkv_list], dim=0).to(self.device)
-            v = torch.stack([t[2] for t in qkv_list], dim=0).to(self.device)
+            if self.qkv_mode == "shared":
+                qkv_list = self.qkv.forward_image(img, self.patch_size)
+                q = torch.stack([t[0] for t in qkv_list], dim=0).to(self.device)
+                k = torch.stack([t[1] for t in qkv_list], dim=0).to(self.device)
+                v = torch.stack([t[2] for t in qkv_list], dim=0).to(self.device)
+            else:
+                q, k, v = self.qkv.forward_image(img, self.patch_size)
+                q = q.to(self.device)
+                k = k.to(self.device)
+                v = v.to(self.device)
             attn_out = self.attn(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))  # [1, P, v_dim]
             emb = aggregate_patches(attn_out, mode=self.agg_mode)  # [1, in_dim]
             outputs.append(emb.squeeze(0))
