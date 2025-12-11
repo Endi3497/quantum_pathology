@@ -36,6 +36,21 @@ def split_patch_angles(image: torch.Tensor, patch_size: int | Sequence[int]) -> 
     return angles
 
 
+def split_patch_angles_batch(images: torch.Tensor, patch_size: int | Sequence[int]) -> torch.Tensor:
+    """
+    Args:
+        images: Tensor [B, C, H, W] with values in [0, 255].
+    Returns:
+        angles: Tensor [B, num_patches, C * patch_area] in [0, pi].
+    """
+    if images.ndim != 4:
+        raise ValueError("images must have shape [B, C, H, W]")
+    patch_h, patch_w = _normalize_patch_size(patch_size)
+    unfold = F.unfold(images, kernel_size=(patch_h, patch_w), stride=(patch_h, patch_w))  # [B, C*ph*pw, P]
+    patches = unfold.transpose(1, 2)  # [B, P, C*ph*pw]
+    return patches.clamp(0, 1).float() * math.pi
+
+
 def encode_params(circuit: QuantumCircuit, params: Sequence, num_qubits: int = 8) -> None:
     idx = 0
     total = len(params)
@@ -471,7 +486,7 @@ class SharedQKVProjector(nn.Module):
         self.device = torch.device(device) if device is not None else None
         self.trainable = trainable
         if trainable:
-            self.theta = nn.Parameter(torch.rand(ansatz.param_shape, dtype=torch.float32) * 2 * math.pi)
+            self.theta = nn.Parameter(torch.randn(ansatz.param_shape, dtype=torch.float32) * 0.1)
         fdim = ansatz.feature_dim
         self.query = nn.Linear(fdim, q_dim, bias=False)
         self.key = nn.Linear(fdim, k_dim, bias=False)
@@ -507,6 +522,28 @@ class SharedQKVProjector(nn.Module):
             return [(q[i], k[i], v[i]) for i in range(q.shape[0])]
         return [self.forward_patch(a.tolist(), param_values) for a in angles]
 
+    def forward_batch(
+        self, images: torch.Tensor, patch_size: int | Sequence[int], param_values: Sequence[float] | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Vectorized batch path: images [B, C, H, W] -> q/k/v [B, P, D].
+        """
+        angles = split_patch_angles_batch(images, patch_size)  # [B, P, data_dim]
+        bsz, num_patches, data_dim = angles.shape
+        angle_flat = angles.reshape(-1, data_dim).to(self.device or angles.device)
+        if self.trainable:
+            feats = self.ansatz.torch_features(angle_flat, self.theta)
+            if feats.dim() == 1:
+                feats = feats.unsqueeze(0)
+        else:
+            feats_np = [self.ansatz.features(a.tolist(), param_values) for a in angle_flat]
+            feats = torch.as_tensor(feats_np, dtype=torch.float32, device=self.device or angles.device)
+        feats = feats.reshape(bsz, num_patches, -1)
+        q = self.query(feats)
+        k = self.key(feats)
+        v = self.value(feats)
+        return q, k, v
+
 
 class SeparateQKVProjector(nn.Module):
     def __init__(
@@ -524,9 +561,9 @@ class SeparateQKVProjector(nn.Module):
         self.device = torch.device(device) if device is not None else None
         self.trainable = trainable
         if trainable:
-            self.theta_q = nn.Parameter(torch.zeros(ansatz_q.param_shape, dtype=torch.float32))
-            self.theta_k = nn.Parameter(torch.zeros(ansatz_k.param_shape, dtype=torch.float32))
-            self.theta_v = nn.Parameter(torch.zeros(ansatz_v.param_shape, dtype=torch.float32))
+            self.theta_q = nn.Parameter(torch.randn(ansatz_q.param_shape, dtype=torch.float32) * 0.1)
+            self.theta_k = nn.Parameter(torch.randn(ansatz_k.param_shape, dtype=torch.float32) * 0.1)
+            self.theta_v = nn.Parameter(torch.randn(ansatz_v.param_shape, dtype=torch.float32) * 0.1)
 
     def forward_image(
         self, image: torch.Tensor, patch_size: int | Sequence[int], param_values=None
@@ -563,6 +600,41 @@ class SeparateQKVProjector(nn.Module):
             k = k.unsqueeze(0)
         if v.dim() == 1:
             v = v.unsqueeze(0)
+        return q, k, v
+
+    def forward_batch(
+        self, images: torch.Tensor, patch_size: int | Sequence[int], param_values=None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Vectorized batch path: images [B, C, H, W] -> q/k/v [B, P, D].
+        """
+        angles = split_patch_angles_batch(images, patch_size)  # [B, P, data_dim]
+        bsz, num_patches, data_dim = angles.shape
+        angle_flat = angles.reshape(-1, data_dim).to(self.device or angles.device)
+        if self.trainable:
+            q_feats = self.ansatz_q.torch_features(angle_flat, self.theta_q)
+            k_feats = self.ansatz_k.torch_features(angle_flat, self.theta_k)
+            v_feats = self.ansatz_v.torch_features(angle_flat, self.theta_v)
+            if q_feats.dim() == 1:
+                q_feats = q_feats.unsqueeze(0)
+            if k_feats.dim() == 1:
+                k_feats = k_feats.unsqueeze(0)
+            if v_feats.dim() == 1:
+                v_feats = v_feats.unsqueeze(0)
+        else:
+            pv = param_values or {}
+            q_params = pv.get("q")
+            k_params = pv.get("k")
+            v_params = pv.get("v")
+            q_np = [self.ansatz_q.features(a.tolist(), q_params) for a in angle_flat]
+            k_np = [self.ansatz_k.features(a.tolist(), k_params) for a in angle_flat]
+            v_np = [self.ansatz_v.features(a.tolist(), v_params) for a in angle_flat]
+            q_feats = torch.as_tensor(q_np, dtype=torch.float32, device=self.device or angles.device)
+            k_feats = torch.as_tensor(k_np, dtype=torch.float32, device=self.device or angles.device)
+            v_feats = torch.as_tensor(v_np, dtype=torch.float32, device=self.device or angles.device)
+        q = q_feats.reshape(bsz, num_patches, -1)
+        k = k_feats.reshape(bsz, num_patches, -1)
+        v = v_feats.reshape(bsz, num_patches, -1)
         return q, k, v
 
 
@@ -633,22 +705,13 @@ class HybridQuantumClassifier(nn.Module):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         if images.dim() != 4:
             raise ValueError("images must be [B, C, H, W]")
-        outputs = []
-        for img in images:
-            if self.qkv_mode == "shared":
-                qkv_list = self.qkv.forward_image(img, self.patch_size)
-                q = torch.stack([t[0] for t in qkv_list], dim=0).to(self.device)
-                k = torch.stack([t[1] for t in qkv_list], dim=0).to(self.device)
-                v = torch.stack([t[2] for t in qkv_list], dim=0).to(self.device)
-            else:
-                q, k, v = self.qkv.forward_image(img, self.patch_size)
-                q = q.to(self.device)
-                k = k.to(self.device)
-                v = v.to(self.device)
-            attn_out = self.attn(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))  # [1, P, v_dim]
-            emb = aggregate_patches(attn_out, mode=self.agg_mode)  # [1, in_dim]
-            outputs.append(emb.squeeze(0))
-        feats = torch.stack(outputs, dim=0)
+        images = images.to(self.device)
+        if self.qkv_mode == "shared":
+            q, k, v = self.qkv.forward_batch(images, self.patch_size)
+        else:
+            q, k, v = self.qkv.forward_batch(images, self.patch_size)
+        attn_out = self.attn(q, k, v)  # [B, P, dim]
+        feats = aggregate_patches(attn_out, mode=self.agg_mode)  # [B, in_dim]
         return self.classifier(feats)
 
 
@@ -684,6 +747,7 @@ class StackedSelfAttention(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([AttentionLayer(attn_type, gamma) for _ in range(num_layers)])
         self.proj = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_layers)])
+        self.norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         # q, k, v: [B, P, D] or [P, D]
@@ -692,9 +756,9 @@ class StackedSelfAttention(nn.Module):
             k = k.unsqueeze(0)
             v = v.unsqueeze(0)
         x = v
-        for attn, proj in zip(self.layers, self.proj):
+        for attn, proj, norm in zip(self.layers, self.proj, self.norm):
             out = attn(q, k, x)
-            x = proj(out)
+            x = norm(x + proj(out))
         return x
 
 
@@ -728,7 +792,6 @@ class BinaryClassifier(nn.Module):
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
         layers.append(nn.Linear(dims[-1], 1))
-        layers.append(nn.Sigmoid())
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

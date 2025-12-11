@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
+from collections import Counter
 
 import math
 import os
@@ -11,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split, Subset
+from torch.utils.data import DataLoader, Dataset, random_split, Subset, WeightedRandomSampler
 
 # Map text labels to binary targets; anything else is skipped.
 STATUS_TO_LABEL = {"Positive": 1, "Negative": 0}
@@ -248,6 +249,7 @@ def build_loaders_with_split(
     test_ratio: float = 0.15,
     seed: int = 42,
     patient_split: bool = True,
+    balance_sampler: bool = False,
 ) -> Tuple[Tuple[DataLoader, Dataset], Tuple[DataLoader, Dataset], Tuple[DataLoader, Dataset]]:
     full_dataset = TwoChannelGridDataset(
         image_dir=image_dir,
@@ -259,8 +261,27 @@ def build_loaders_with_split(
         train_set, val_set, test_set = split_dataset_by_patient(full_dataset, train_ratio, val_ratio, test_ratio, seed)
     else:
         train_set, val_set, test_set = split_dataset(full_dataset, train_ratio, val_ratio, test_ratio, seed)
+
+    train_sampler = None
+    if balance_sampler:
+        if not hasattr(train_set, "indices"):
+            raise ValueError("Expected train_set to be a Subset with indices for balanced sampling.")
+        labels = [full_dataset.samples[i][1] for i in train_set.indices]
+        total = len(labels)
+        if total == 0:
+            raise ValueError("Train set is empty; cannot build weighted sampler.")
+        counts = Counter(labels)
+        # Inverse frequency weights to balance classes
+        class_weights = {cls: total / (2 * max(1, cnt)) for cls, cnt in counts.items()}
+        weights = torch.as_tensor([class_weights[lbl] for lbl in labels], dtype=torch.double)
+        train_sampler = WeightedRandomSampler(weights, num_samples=total, replacement=True)
     train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
+        train_set,
+        batch_size=batch_size,
+        shuffle=not balance_sampler,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory

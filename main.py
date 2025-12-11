@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import copy
 import itertools
+import random
+from collections import Counter
 from pathlib import Path
+import numpy as np
 import torch
 from torch import nn, optim
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_recall_fscore_support
@@ -24,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-dir", type=Path, default=Path("/home/junyeollee/QSANN/data/TCGA_BRCA_128x128/grid/4patch"))
     parser.add_argument("--labels-csv", type=Path, default=Path("/home/junyeollee/QSANN/data/TCGA_BRCA_128x128/DX1_ER_PR_HER2.csv"))
     parser.add_argument("--target-column", type=str, default="ER_status_BCR", choices=["ER_status_BCR", "PR_status_BCR", "HER2_status_BCR"])
-    parser.add_argument("--image-size", type=int, default=64)
+    parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--patch-size", type=int, default=4)
 
     # Quantum ansatz
@@ -36,9 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # QKV options
     parser.add_argument("--qkv-mode", type=str, default="shared", choices=["shared", "separate"])
-    parser.add_argument("--q-dim", type=int, default=32)
-    parser.add_argument("--k-dim", type=int, default=32)
-    parser.add_argument("--v-dim", type=int, default=32)
+    parser.add_argument("--qkv-dim", type=int, default=32, help="Dimension used for Q/K/V projections (all equal).")
 
     # Data split
     parser.add_argument("--train-ratio", type=float, default=0.6)
@@ -61,18 +62,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agg-mode", type=str, default="concat", choices=["concat", "gap_gmp"])
 
     # Classifier
-    parser.add_argument("--hidden-dims", type=int, nargs="*", default=[128])
+    parser.add_argument("--hidden-dims", type=int, nargs="*", default=[])
     parser.add_argument("--dropout", type=float, default=0.5)
 
     # Training
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=32)
-    parser.add_argument("--device", type=str, default="cuda:0", choices=["cpu", "cuda:0"])
+    parser.add_argument("--device", type=str, default="cuda:0", choices=["cpu", "cuda:0", "cuda:1", "cuda:2", "cuda:3"])
     parser.add_argument("--early-stop", action="store_true")
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
+    parser.add_argument("--no-pos-weight", action="store_true", help="Disable class-balanced pos_weight in BCE loss.")
+    parser.add_argument(
+        "--no-balance-sampler",
+        action="store_true",
+        help="Disable class-balanced weighted sampler for the training loader.",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
 
     # Logging / checkpoints
     parser.add_argument("--log-dir", type=Path, default=Path("results/logs"))
@@ -84,9 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid-vqc-layers", type=int, nargs="*", help="List of vqc_layers to sweep.")
     parser.add_argument("--grid-measurements", type=str, nargs="*", choices=["statevector", "correlations"])
     parser.add_argument("--grid-qkv-modes", type=str, nargs="*", choices=["shared", "separate"])
-    parser.add_argument("--grid-q-dims", type=int, nargs="*", help="List of q dims to sweep.")
-    parser.add_argument("--grid-k-dims", type=int, nargs="*", help="List of k dims to sweep.")
-    parser.add_argument("--grid-v-dims", type=int, nargs="*", help="List of v dims to sweep.")
+    parser.add_argument("--grid-qkv-dims", type=int, nargs="*", help="List of shared qkv dims to sweep.")
     parser.add_argument("--grid-attn-layers", type=int, nargs="*", help="List of attention layers to sweep.")
 
     return parser
@@ -99,6 +105,14 @@ def main() -> None:
     best_overall = {"auroc": -1.0, "run_name": None}
 
     def run_once(cfg: argparse.Namespace) -> dict:
+        # Reproducibility
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        torch.manual_seed(cfg.seed)
+        torch.cuda.manual_seed_all(cfg.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        qkv_dim = cfg.qkv_dim
         device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
         (train_loader, train_set), (val_loader, val_set), (test_loader, test_set) = build_loaders_with_split(
             image_dir=cfg.image_dir,
@@ -112,10 +126,26 @@ def main() -> None:
             val_ratio=cfg.val_ratio,
             test_ratio=cfg.test_ratio,
             patient_split=cfg.patient_split,
+            balance_sampler=not cfg.no_balance_sampler,
+            seed=cfg.seed,
         )
         print(
             f"[run {cfg.run_name}] Data splits -> train: {len(train_set)}, val: {len(val_set)}, test: {len(test_set)} | "
             f"batch_size: {cfg.batch_size}, image_size: {cfg.image_size}, patch_size: {cfg.patch_size}, device: {device}"
+        )
+
+        train_labels = [train_set.dataset.samples[i][1] for i in train_set.indices]
+        class_counts = Counter(train_labels)
+        pos_count = class_counts.get(1, 0)
+        neg_count = class_counts.get(0, 0)
+        pos_weight_tensor = None
+        pos_weight_val = None
+        if not cfg.no_pos_weight and pos_count > 0 and neg_count > 0:
+            pos_weight_val = neg_count / pos_count
+            pos_weight_tensor = torch.tensor([pos_weight_val], dtype=torch.float32, device=device)
+        print(
+            f"[run {cfg.run_name}] Class balance -> pos: {pos_count}, neg: {neg_count}"
+            + (f", pos_weight: {pos_weight_val:.3f}" if pos_weight_val is not None else " (pos_weight disabled)")
         )
 
         ansatz = QuantumAnsatz(
@@ -131,9 +161,9 @@ def main() -> None:
                 image_size=cfg.image_size,
                 patch_size=cfg.patch_size,
                 ansatz=ansatz,
-                q_dim=cfg.q_dim,
-                k_dim=cfg.k_dim,
-                v_dim=cfg.v_dim,
+                q_dim=qkv_dim,
+                k_dim=qkv_dim,
+                v_dim=qkv_dim,
                 attn_layers=cfg.attn_layers,
                 attn_type=cfg.attn_type,
                 rbf_gamma=cfg.rbf_gamma,
@@ -166,9 +196,9 @@ def main() -> None:
                 ansatz=ansatz,
                 ansatz_k=ansatz_k,
                 ansatz_v=ansatz_v,
-                q_dim=cfg.q_dim,
-                k_dim=cfg.k_dim,
-                v_dim=cfg.v_dim,
+                q_dim=qkv_dim,
+                k_dim=qkv_dim,
+                v_dim=qkv_dim,
                 attn_layers=cfg.attn_layers,
                 attn_type=cfg.attn_type,
                 rbf_gamma=cfg.rbf_gamma,
@@ -178,7 +208,9 @@ def main() -> None:
                 device=device,
                 qkv_mode="separate",
             )
-        criterion = nn.BCELoss()
+        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[run {cfg.run_name}] Trainable parameters: {param_count:,}")
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
         optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
 
         best_val_loss = float("inf")
@@ -212,7 +244,8 @@ def main() -> None:
             if all_labels:
                 labels_cat = torch.cat(all_labels)
                 outputs_cat = torch.cat(all_outputs)
-                preds = (outputs_cat >= 0.5).int()
+                probs = torch.sigmoid(outputs_cat)
+                preds = (probs >= 0.5).int()
                 acc = accuracy_score(labels_cat.numpy(), preds.numpy())
             else:
                 acc = 0.0
@@ -250,7 +283,7 @@ def main() -> None:
         if all_labels:
             y_true = torch.cat(all_labels).numpy()
             y_scores = torch.cat(all_outputs).numpy()
-            y_pred = (y_scores >= 0.5).astype(int)
+            y_pred = (torch.sigmoid(torch.from_numpy(y_scores)) >= 0.5).int().numpy()
             metrics["acc"] = accuracy_score(y_true, y_pred)
             try:
                 metrics["auroc"] = roc_auc_score(y_true, y_scores)
@@ -281,9 +314,7 @@ def main() -> None:
         "vqc_layers": args.grid_vqc_layers,
         "measurement": args.grid_measurements,
         "qkv_mode": args.grid_qkv_modes,
-        "q_dim": args.grid_q_dims,
-        "k_dim": args.grid_k_dims,
-        "v_dim": args.grid_v_dims,
+        "qkv_dim": args.grid_qkv_dims,
         "attn_layers": args.grid_attn_layers,
     }
     sweep_lists = {k: v for k, v in grid_fields.items() if v}
